@@ -10,10 +10,11 @@ import time
 import paho.mqtt.client as mqtt
 from datetime import datetime, timedelta
 import json
+import wandb
 
 app = FastAPI()
-CONTEXT_LEN = 8
-PRED_LEN = 3
+CONTEXT_LEN = 30
+PRED_LEN = 6
 
 # Store predictors per pod
 predictors = {}
@@ -40,7 +41,7 @@ def on_message(client, userdata, msg):
 
             # ensure predictor exists
             if pod not in predictors:
-                predictors[pod] = TimesfmPredictor(context_len=CONTEXT_LEN, pred_len=PRED_LEN)
+                predictors[pod] = TimesfmPredictor(pod_name=pod, context_len=CONTEXT_LEN, pred_len=PRED_LEN)
 
             last_data = previous_metrics.get(pod, None)
             if last_data:
@@ -76,7 +77,7 @@ def start_mqtt_subscriber():
     thread = threading.Thread(target=client.loop_forever, daemon=True)
     thread.start()
 
-def background_finetune_and_predict():
+def background_finetune(interval: int = 60):
     def loop():
         while True:
             try:
@@ -85,23 +86,23 @@ def background_finetune_and_predict():
                     # Optionally: POST preds to another service here
             except Exception as e:
                 print(f"Background finetune/predict error: {e}")
-            time.sleep(60)
+            time.sleep(interval)
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
 
 @app.on_event("startup")
 def startup_event():
     start_mqtt_subscriber()
-    background_finetune_and_predict()
+    # background_finetune(interval=300)  # every 10 minutes
 
-@app.post("/finetune")
-def finetune():
-    try:
-        for pod, predictor in predictors.items():
-            predictor.finetune()
-        return {"status": "finetuned"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.post("/finetune")
+# def finetune():
+#     try:
+#         for pod, predictor in predictors.items():
+#             predictor.finetune()
+#         return {"status": "finetuned"}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/metrics")
 def predict():
@@ -110,6 +111,9 @@ def predict():
         for pod, predictor in predictors.items():
             if predictor_heartbeat.get(pod, 0) == 0:
                 continue
+            if predictor.get_metrics_length() < CONTEXT_LEN:
+                continue
+
             predictor_heartbeat[pod] -= 1 # decrement heartbeat counter
             preds = predictor.predict()
             # for idx, val in enumerate(preds):
