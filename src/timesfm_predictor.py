@@ -26,24 +26,33 @@ from paxml import trainer_lib
 from paxml import checkpoints
 from paxml import learners
 from paxml import checkpoint_types
+from sklearn.linear_model import LinearRegression
 
 import wandb
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 os.environ['JAX_PMAP_USE_TENSORSTORE'] = 'false'
 wandb_project = "timesfm-cpu-prediction"
+use_pod_num=True
+
+def compute_trend(cpu_values):
+    x = np.arange(len(cpu_values)).reshape(-1, 1)
+    y = np.array(cpu_values)
+    model = LinearRegression().fit(x, y)
+    return model.coef_[0]  # slope
+
 class TimesfmPredictor:
     def __init__(self, pod_name, context_len=64, pred_len=8):
         self.pod_name = pod_name
         self.context_len = context_len
         self.pred_len = pred_len
-        self.tfm = self._load_pretrained_model()
+        self.tfm = self._load_pretrained_model(context_len=context_len, horizon_len=pred_len)
         self.wb_runner = None
         # collected metrics buffer
         self.cpu_buffer = []   # [(timestamp, value)]
         self.covariates_buffer = defaultdict(list)
         self.past_predicted_cpu = []
-        self.covariate_keys = ["n3", "n4", "n6"]
+        self.covariate_keys = ["n3", "n4", "n6", "pod_num"]
         # 用來保存每次預測的結果
         self.pred_history = []   # list of dicts: {"preds": [...], "gt": [...]}
         self._set_covariates()
@@ -56,24 +65,26 @@ class TimesfmPredictor:
         self.wb_runner.define_metric("n3", step_metric="timestamp")
         self.wb_runner.define_metric("n4", step_metric="timestamp")
         self.wb_runner.define_metric("n6", step_metric="timestamp")
+        self.wb_runner.define_metric("pod_num", step_metric="timestamp")
         
     def _set_covariates(self):
         padding = list(np.zeros(shape=(self.pred_len,), dtype=float))
         self.covariates_buffer = {k: padding for k in self.covariate_keys}
         print(f"Initialized covariates buffer with keys: {self.covariates_buffer}")
         
-    def _load_pretrained_model(self):
+    def _load_pretrained_model(self, horizon_len=128, context_len=512):
         tfm = timesfm.TimesFm(
             hparams=timesfm.TimesFmHparams(
                 backend="gpu",
-                per_core_batch_size=32,
-                horizon_len=128,
+                per_core_batch_size=1,
+                horizon_len=8,
                 num_layers=10,
                 use_positional_embedding=False,
-                context_len=512,
+                context_len=64,
             ),
             checkpoint=timesfm.TimesFmCheckpoint(
-                huggingface_repo_id="google/timesfm-2.0-500m-jax"
+                huggingface_repo_id="google/timesfm-2.0-500m-jax",
+                local_dir="./checkpoints/pretrained_checkpoint"
             ),
         )
         return tfm
@@ -90,7 +101,7 @@ class TimesfmPredictor:
         ts = pd.to_datetime(metrics["timestamp"])
         self.cpu_buffer.append((ts, metrics["cpu_usage"]))
         self.wb_runner.log({"cpu_usage": metrics["cpu_usage"], "timestamp": ts.timestamp()})
-        
+
         for k, v in metrics.items():
             if k in self.covariate_keys:
                 self.covariates_buffer[k].append((ts, v))
@@ -103,6 +114,7 @@ class TimesfmPredictor:
             "n3": metrics.get("n3", None),
             "n4": metrics.get("n4", None),
             "n6": metrics.get("n6", None),
+            "pod_num": metrics.get("pod_num", None),
         }
 
         csv_path = f"{self.pod_name}_metrics.csv"
@@ -372,32 +384,48 @@ class TimesfmPredictor:
         
         cpu_values = [v for _, v in self.cpu_buffer[-self.context_len:]]
         cpu = np.array(cpu_values).reshape(1, -1)
-        preds, _ = self.tfm.forecast_with_covariates(
-            cpu,
-            dynamic_numerical_covariates={
-                k: [[v for _, v in self.covariates_buffer[k][- (self.context_len + self.pred_len):]]]
-                for k in self.covariate_keys
-            },
-            normalize_xreg_target_per_input=False
-        )
+        try:
+            # preds, _ = self.tfm.forecast(cpu)
+            preds, _ = self.tfm.forecast_with_covariates(
+                cpu,
+                dynamic_numerical_covariates={
+                    k: [[v for _, v in self.covariates_buffer[k][- (self.context_len + self.pred_len):]]]
+                    for k in self.covariate_keys
+                },
+                normalize_xreg_target_per_input=False
+            )
+
+        except Exception as e:
+            raise ValueError(f"Error during prediction: {e}")
+            return None
+        
         preds = preds[0].tolist()
+        for i, p in enumerate(preds):
+            preds[i] = max(0, min(p, 3))  # clamp to [0, 3]
         print(f"Predictions: {preds}")
         
         # ground truth: 預測 horizon 的未來段落（如果有的話）
         if len(self.pred_history) > 0:
-            gt_ts = [ts for ts, _ in self.cpu_buffer[-self.pred_len:]]
+            gt_ts = []
             gt_values = []
-            for i in range(len(self.cpu_buffer)-self.pred_len, 0, -1):
-                if self.cpu_buffer[i][0] == self.pred_history[-1]["start_ts"]:
+            for i in range(len(self.cpu_buffer)-1, 0, -1):
+                # print(f"Checking cpu_buffer index {i} with timestamp {self.cpu_buffer[i][0]} against last pred start_ts {self.pred_history[-1]['start_ts']}")
+                
+                if abs(self.pred_history[-1]["start_ts"].timestamp() - self.cpu_buffer[i][0].timestamp()) < 5:
+                    # get ground truth values with the same length as pred_len (previous predictions)
+                    gt_ts = [ts for ts, _ in self.cpu_buffer[i:i + self.pred_len]]
                     gt_values = [v for _, v in self.cpu_buffer[i:i + self.pred_len]]
                     break
-            print(f"Ground truth timestamps: {gt_ts}, values: {gt_values}")
+                
+            # print(f"Ground truth timestamps: {gt_ts}, values: {gt_values}")
+            
             last_pred = self.pred_history[-1]
             if last_pred["start_ts"] != gt_ts[0]:
                 print("Warning: Ground truth timestamps do not align with last prediction start time.")
                 print(f"Last prediction start_ts: {last_pred['start_ts']}, GT timestamps: {gt_ts}")
             eval_score = self.evaluate(gt_values, last_pred["preds"])
             self.pred_history[-1]["gt"] = gt_values
+            self.pred_history[-1]["actual_75"] = np.percentile(gt_values, 75) if gt_values else None
             self.pred_history[-1]["mae"] = eval_score
             self.wb_runner.log({"mae": eval_score})
             print(f"Evaluation (MAE): {eval_score}")
@@ -405,13 +433,27 @@ class TimesfmPredictor:
             gt_values = []
             eval_score = None
             
+        prediction = np.percentile(preds, 75)
+        # 計算預測趨勢
+        # extremum = min(3, max(preds))
+        # trend = "increasing"
+        # if compute_trend(preds) > 0:
+        #     # increasing trend
+        #     extremum = min(3, max(preds))
+        #     trend = "increasing"
+        # else:
+        #     extremum = max(0, min(preds))
+        #     trend = "decreasing"
+
         # 存預測，帶上 timestamp 範圍
         start_ts = self.cpu_buffer[-1][0]  # 最後一個已知點的時間
         self.pred_history.append({
             "start_ts": start_ts + timedelta(seconds=10),
             "preds": preds,
             "gt": [],
-            "mae": None
+            "mae": None,
+            "actual_75": None,
+            "pred_75": prediction,
         })
         # for i in self.pred_len:
         #     self.wb_runner.log({"predicted_cpu_usage": preds[i], "timestamp": (start_ts + timedelta(seconds=10*(i+1))).timestamp()})
@@ -419,8 +461,9 @@ class TimesfmPredictor:
         if plot:
             self.plot()
             self.plot_evaluation()
+            # self.plot_residual()
         
-        return min(max(preds), 3)
+        return prediction
 
     def evaluate(self, ground_truth: list, predictions: list, plot: bool = True):
         """Evaluate predictions (e.g., MAE)."""
@@ -436,14 +479,17 @@ class TimesfmPredictor:
         values = [v for _, v in self.cpu_buffer]
         plt.plot(ts_axis, values, label="Ground Truth")
 
-        # 繪製每段預測
-        pred_ts = []
-        pred = []
+        # Use a dictionary to collect all predictions for plotting
+        # overwrite preds to avoid overlapping lines
+        preds = defaultdict(float)
         for ph in self.pred_history:
             if "start_ts" in ph and len(ph["preds"]) > 0:
-                pred_ts.extend([ph["start_ts"] + timedelta(seconds=10) * (i) for i in range(len(ph["preds"]))])
-                pred.extend(ph["preds"])
-        plt.plot(pred_ts, pred, "--", label="Prediction")
+                for i, p in enumerate(ph["preds"]):
+                    preds[ph["start_ts"] + timedelta(seconds=10 * i)] = p
+                    
+        sorted_preds = dict(sorted(preds.items()))
+        # print(f"All predictions for plotting: {sorted_preds.keys()}, {sorted_preds.values()}")
+        plt.plot(sorted_preds.keys(), sorted_preds.values(), "--", label="Prediction")
         plt.legend()
         plt.grid(True)
 
@@ -485,4 +531,35 @@ class TimesfmPredictor:
 
         plt.tight_layout()
         plt.savefig(f"../prediction/{self.pod_name}_evaluation.png")
+        plt.close()
+    
+    def plot_residual(self):
+        """Plot residuals between ground truth and predictions."""
+    
+        actual_interval_max = [ph["actual_75"] for ph in self.pred_history if ph["actual_75"] is not None]
+        pred_interval_max = [ph["pred_75"] for ph in self.pred_history if ph["actual_75"] is not None]
+        if not actual_interval_max or not pred_interval_max:
+            print("No data to plot residuals.")
+            return
+        times = [ph["start_ts"] for ph in self.pred_history if ph["actual_75"] is not None]
+
+        # print(f"Plotting residuals. Actual max: {actual_interval_max}, Pred max: {pred_interval_max}, Times: {times}")
+        plt.figure(figsize=(10,5))
+        plt.plot(times, actual_interval_max, '-o', label='Actual Max', color='black')
+        plt.plot(times, pred_interval_max, '-s', label='Predicted Max', color='orange')
+        plt.fill_between(times, actual_interval_max, pred_interval_max, color='orange', alpha=0.2, label='Error Gap')
+
+        plt.xlabel("Prediction Time Step (t)")
+        plt.ylabel("CPU Usage (%)")
+        plt.title("Predicted vs Actual 75th CPU in x-min Horizon")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        # x 軸時間格式
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=10))
+        plt.gcf().autofmt_xdate(rotation=45)
+
+        plt.tight_layout()
+        plt.savefig(f"../prediction/{self.pod_name}_residuals.png")
         plt.close()

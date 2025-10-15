@@ -42,7 +42,7 @@ def on_message(client, userdata, msg):
             # ensure predictor exists
             if pod not in predictors:
                 predictors[pod] = TimesfmPredictor(pod_name=pod, context_len=CONTEXT_LEN, pred_len=PRED_LEN)
-
+            m["pod_num"] = len(predictors)  # add pod_num for potential feature use
             last_data = previous_metrics.get(pod, None)
             if last_data:
                 last_ts = datetime.strptime(last_data["timestamp"], "%Y-%m-%dT%H:%M:%S.%f")
