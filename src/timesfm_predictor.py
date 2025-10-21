@@ -34,6 +34,7 @@ os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 os.environ['JAX_PMAP_USE_TENSORSTORE'] = 'false'
 wandb_project = "timesfm-cpu-prediction"
 use_pod_num=True
+LOG_FILELIST = ["./api.py", "./timesfm_predictor.py"]
 
 def compute_trend(cpu_values):
     x = np.arange(len(cpu_values)).reshape(-1, 1)
@@ -48,15 +49,21 @@ class TimesfmPredictor:
         self.pred_len = pred_len
         self.tfm = self._load_pretrained_model(context_len=context_len, horizon_len=pred_len)
         self.wb_runner = None
+        self.log_folder = f"../results/{self.pod_name}/"
         # collected metrics buffer
         self.cpu_buffer = []   # [(timestamp, value)]
         self.covariates_buffer = defaultdict(list)
         self.past_predicted_cpu = []
-        self.covariate_keys = ["n3", "n4", "n6", "pod_num"]
+        self.covariate_keys = ["n3", "n4", "n6", "pod_num", "session_count"]
         # 用來保存每次預測的結果
         self.pred_history = []   # list of dicts: {"preds": [...], "gt": [...]}
         self._set_covariates()
         self._wandb_init()
+    
+    def __del__(self):
+        if self.wb_runner is not None:
+            self.wb_runner.log_code(root=self.log_folder, include_fn=lambda path: True)
+            self.wb_runner.finish()
         
     def _wandb_init(self):
         self.wb_runner = wandb.init(project=wandb_project, name=self.pod_name, reinit="create_new")
@@ -66,7 +73,8 @@ class TimesfmPredictor:
         self.wb_runner.define_metric("n4", step_metric="timestamp")
         self.wb_runner.define_metric("n6", step_metric="timestamp")
         self.wb_runner.define_metric("pod_num", step_metric="timestamp")
-        
+        self.wb_runner.define_metric("session_count", step_metric="timestamp")
+
     def _set_covariates(self):
         padding = list(np.zeros(shape=(self.pred_len,), dtype=float))
         self.covariates_buffer = {k: padding for k in self.covariate_keys}
@@ -84,11 +92,11 @@ class TimesfmPredictor:
             ),
             checkpoint=timesfm.TimesFmCheckpoint(
                 huggingface_repo_id="google/timesfm-2.0-500m-jax",
-                local_dir="./checkpoints/pretrained_checkpoint"
+                local_dir="./checkpoints/pretrained_checkpoint/checkpoint_1301"
             ),
         )
         return tfm
-    
+
     def get_metrics_length(self):
         return len(self.cpu_buffer)
 
@@ -115,9 +123,10 @@ class TimesfmPredictor:
             "n4": metrics.get("n4", None),
             "n6": metrics.get("n6", None),
             "pod_num": metrics.get("pod_num", None),
+            "sessionn_count": metrics.get("sessionn_count", None),
         }
 
-        csv_path = f"{self.pod_name}_metrics.csv"
+        csv_path = f"{self.log_folder}/metrics.csv"
         file_exists = os.path.isfile(csv_path)
 
         df = pd.DataFrame([row])
@@ -136,7 +145,7 @@ class TimesfmPredictor:
         start_time = time.time()
         print(f"Starting finetuning for {self.pod_name}. ")
         
-        data_path = f"{self.pod_name}_metrics.csv"
+        data_path = f"{self.log_folder}/metrics.csv"
         data_df = pd.read_csv(open(data_path, "r"))
         data_df.drop(columns=["pod", "time"], inplace=True, errors="ignore")
 
@@ -157,7 +166,7 @@ class TimesfmPredictor:
         NUM_EPOCHS = 5
         PATIENCE = 5
         TRAIN_STEPS_PER_EVAL = 100
-        CHECKPOINT_DIR=f"./checkpoints/{self.pod_name}"
+        CHECKPOINT_DIR=f"{self.log_folder}/checkpoints/"
 
         config = dict(context_len=self.context_len, 
                       pred_len=self.pred_len, 
@@ -379,17 +388,22 @@ class TimesfmPredictor:
 
     def predict(self, plot=True):
         """Predict the next pred_len cpu usage values."""
-        if len(self.cpu_buffer) < self.context_len:
-            raise ValueError("Not enough data for prediction")
-        
-        cpu_values = [v for _, v in self.cpu_buffer[-self.context_len:]]
+        cpu_values = []
+        ctn_len = min(self.context_len, len(self.cpu_buffer))
+        if ctn_len == 0:
+            raise ValueError("No data for prediction")
+        # if len(self.cpu_buffer) < self.context_len and len(self.cpu_buffer) > 0:
+            # raise ValueError("Not enough data for prediction")
+            # cpu_values = [v for _, v in self.cpu_buffer]
+
+        cpu_values = [v for _, v in self.cpu_buffer[-ctn_len:]]
         cpu = np.array(cpu_values).reshape(1, -1)
         try:
             # preds, _ = self.tfm.forecast(cpu)
             preds, _ = self.tfm.forecast_with_covariates(
                 cpu,
                 dynamic_numerical_covariates={
-                    k: [[v for _, v in self.covariates_buffer[k][- (self.context_len + self.pred_len):]]]
+                    k: [[v for _, v in self.covariates_buffer[k][- (ctn_len + self.pred_len):]]]
                     for k in self.covariate_keys
                 },
                 normalize_xreg_target_per_input=False
@@ -397,11 +411,10 @@ class TimesfmPredictor:
 
         except Exception as e:
             raise ValueError(f"Error during prediction: {e}")
-            return None
         
         preds = preds[0].tolist()
         for i, p in enumerate(preds):
-            preds[i] = max(0, min(p, 3))  # clamp to [0, 3]
+            preds[i] = max(0, p)
         print(f"Predictions: {preds}")
         
         # ground truth: 預測 horizon 的未來段落（如果有的話）
@@ -433,7 +446,8 @@ class TimesfmPredictor:
             gt_values = []
             eval_score = None
             
-        prediction = np.percentile(preds, 75)
+        # prediction = np.percentile(preds, 75)
+        prediction = max(preds)
         # 計算預測趨勢
         # extremum = min(3, max(preds))
         # trend = "increasing"
@@ -470,6 +484,8 @@ class TimesfmPredictor:
         n = min(len(ground_truth), len(predictions))
         if n == 0:
             return None
+        # RMSE
+        # rmse = np.sqrt(np.mean((np.array(ground_truth[:n]) - np.array(predictions[:n]))**2))
         return float(np.mean(np.abs(np.array(ground_truth[:n]) - np.array(predictions[:n]))))
     
     def plot(self):
@@ -500,9 +516,9 @@ class TimesfmPredictor:
 
         plt.title("CPU Usage Forecast")
         plt.xlabel("Time")
-        plt.ylabel("CPU Usage")
+        plt.ylabel("CPU Usage(%)")
         plt.tight_layout()
-        plt.savefig(f"../prediction/{self.pod_name}_cpu_usage.png")
+        plt.savefig(f"{self.log_folder}/cpu_usage.png")
         plt.close()
         
     def plot_evaluation(self):
@@ -522,7 +538,7 @@ class TimesfmPredictor:
         plt.ylabel("MAE")
         plt.legend()
         
-        plt.ylim(0, 1)
+        plt.ylim(0, 30)
 
         # x 軸時間格式
         plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -530,7 +546,7 @@ class TimesfmPredictor:
         plt.gcf().autofmt_xdate(rotation=45)
 
         plt.tight_layout()
-        plt.savefig(f"../prediction/{self.pod_name}_evaluation.png")
+        plt.savefig(f"{self.log_folder}/evaluation.png")
         plt.close()
     
     def plot_residual(self):
@@ -561,5 +577,5 @@ class TimesfmPredictor:
         plt.gcf().autofmt_xdate(rotation=45)
 
         plt.tight_layout()
-        plt.savefig(f"../prediction/{self.pod_name}_residuals.png")
+        plt.savefig(f"{self.log_folder}/residuals.png")
         plt.close()

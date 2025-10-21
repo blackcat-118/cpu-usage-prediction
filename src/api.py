@@ -42,6 +42,8 @@ def on_message(client, userdata, msg):
             # ensure predictor exists
             if pod not in predictors:
                 predictors[pod] = TimesfmPredictor(pod_name=pod, context_len=CONTEXT_LEN, pred_len=PRED_LEN)
+                # predictors[pod].finetune()
+            m["cpu_usage"] = float(m["cpu_usage"]) * 100.0
             m["pod_num"] = len(predictors)  # add pod_num for potential feature use
             last_data = previous_metrics.get(pod, None)
             if last_data:
@@ -110,12 +112,21 @@ def predict():
         result = {}
         for pod, predictor in predictors.items():
             if predictor_heartbeat.get(pod, 0) == 0:
+                # skip dead predictors
+                p = predictors.pop(pod)
+                del p
+                predictor_heartbeat.pop(pod)
+                print(f"Removed inactive predictor for pod {pod}")
                 continue
-            if predictor.get_metrics_length() < CONTEXT_LEN:
+            elif predictor_heartbeat.get(pod, 0) < 3:
+                print(f"Warning: Predictor for pod {pod} has low heartbeat {predictor_heartbeat[pod]}")
+                predictor_heartbeat[pod] -= 1 # decrement heartbeat counter
+                continue
+            if predictor.get_metrics_length() == 0:
                 continue
 
             predictor_heartbeat[pod] -= 1 # decrement heartbeat counter
-            preds = predictor.predict()
+            preds = predictor.predict() / 100.0
             # for idx, val in enumerate(preds):
             predicted_cpu.labels(namespace="free5gc", pod=pod).set(preds)
             result[pod] = preds
