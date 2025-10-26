@@ -27,7 +27,7 @@ from paxml import checkpoints
 from paxml import learners
 from paxml import checkpoint_types
 from sklearn.linear_model import LinearRegression
-
+import traceback
 import wandb
 
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
@@ -60,11 +60,12 @@ class TimesfmPredictor:
         self._set_covariates()
         self._wandb_init()
     
-    def __del__(self):
+    def terminate(self):
+        print(f"Releasing resources for pod {self.pod_name}")
         if self.wb_runner is not None:
             self.wb_runner.log_code(root=self.log_folder, include_fn=lambda path: True)
             self.wb_runner.finish()
-        
+
     def _wandb_init(self):
         self.wb_runner = wandb.init(project=wandb_project, name=self.pod_name, reinit="create_new")
         self.wb_runner.define_metric("cpu_usage", step_metric="timestamp")
@@ -112,7 +113,7 @@ class TimesfmPredictor:
 
         for k, v in metrics.items():
             if k in self.covariate_keys:
-                self.covariates_buffer[k].append((ts, v))
+                self.covariates_buffer[k].append(v) # not need timestamp for covariates
                 self.wb_runner.log({k: v, "timestamp": ts.timestamp()})
                 
         # --- Write metrics to CSV ---
@@ -123,7 +124,7 @@ class TimesfmPredictor:
             "n4": metrics.get("n4", None),
             "n6": metrics.get("n6", None),
             "pod_num": metrics.get("pod_num", None),
-            "sessionn_count": metrics.get("sessionn_count", None),
+            "session_count": metrics.get("session_count", None),
         }
 
         csv_path = f"{self.log_folder}/metrics.csv"
@@ -136,9 +137,6 @@ class TimesfmPredictor:
             header=not file_exists,  # write header only once
             index=False
         )
-        # Keep only the latest context_len points
-        # We use data buffer to store the data for prediction or finetuning
-        # self.data_buffer = self.data_buffer[-(self.context_len + self.pred_len):]
 
     def finetune(self):
         
@@ -156,7 +154,7 @@ class TimesfmPredictor:
         int_freq = timesfm.freq_map(freq)
         ts_cols = ["cpu_usage"]
         date_col = "timestamp"
-        num_cov_cols = ["n3", "n4", "n6"]
+        num_cov_cols = ["n3", "n4", "n6", "pod_num", "session_count"]
         cat_cov_cols = None
         num_ts = len(ts_cols)
         
@@ -391,31 +389,31 @@ class TimesfmPredictor:
         cpu_values = []
         ctn_len = min(self.context_len, len(self.cpu_buffer))
         if ctn_len == 0:
-            raise ValueError("No data for prediction")
-        # if len(self.cpu_buffer) < self.context_len and len(self.cpu_buffer) > 0:
-            # raise ValueError("Not enough data for prediction")
-            # cpu_values = [v for _, v in self.cpu_buffer]
+            return ValueError("No data for prediction")
 
         cpu_values = [v for _, v in self.cpu_buffer[-ctn_len:]]
         cpu = np.array(cpu_values).reshape(1, -1)
+
         try:
             # preds, _ = self.tfm.forecast(cpu)
             preds, _ = self.tfm.forecast_with_covariates(
                 cpu,
                 dynamic_numerical_covariates={
-                    k: [[v for _, v in self.covariates_buffer[k][- (ctn_len + self.pred_len):]]]
+                    k: [[v for v in self.covariates_buffer[k][- (ctn_len + self.pred_len):]]]
                     for k in self.covariate_keys
                 },
                 normalize_xreg_target_per_input=False
             )
 
         except Exception as e:
+            traceback.print_exc()
             raise ValueError(f"Error during prediction: {e}")
-        
+            
+        print(f"Predictions: {preds}")
         preds = preds[0].tolist()
         for i, p in enumerate(preds):
             preds[i] = max(0, p)
-        print(f"Predictions: {preds}")
+        
         
         # ground truth: 預測 horizon 的未來段落（如果有的話）
         if len(self.pred_history) > 0:
@@ -448,16 +446,6 @@ class TimesfmPredictor:
             
         # prediction = np.percentile(preds, 75)
         prediction = max(preds)
-        # 計算預測趨勢
-        # extremum = min(3, max(preds))
-        # trend = "increasing"
-        # if compute_trend(preds) > 0:
-        #     # increasing trend
-        #     extremum = min(3, max(preds))
-        #     trend = "increasing"
-        # else:
-        #     extremum = max(0, min(preds))
-        #     trend = "decreasing"
 
         # 存預測，帶上 timestamp 範圍
         start_ts = self.cpu_buffer[-1][0]  # 最後一個已知點的時間
@@ -466,16 +454,11 @@ class TimesfmPredictor:
             "preds": preds,
             "gt": [],
             "mae": None,
-            "actual_75": None,
-            "pred_75": prediction,
         })
-        # for i in self.pred_len:
-        #     self.wb_runner.log({"predicted_cpu_usage": preds[i], "timestamp": (start_ts + timedelta(seconds=10*(i+1))).timestamp()})
         
         if plot:
             self.plot()
             self.plot_evaluation()
-            # self.plot_residual()
         
         return prediction
 
@@ -547,35 +530,4 @@ class TimesfmPredictor:
 
         plt.tight_layout()
         plt.savefig(f"{self.log_folder}/evaluation.png")
-        plt.close()
-    
-    def plot_residual(self):
-        """Plot residuals between ground truth and predictions."""
-    
-        actual_interval_max = [ph["actual_75"] for ph in self.pred_history if ph["actual_75"] is not None]
-        pred_interval_max = [ph["pred_75"] for ph in self.pred_history if ph["actual_75"] is not None]
-        if not actual_interval_max or not pred_interval_max:
-            print("No data to plot residuals.")
-            return
-        times = [ph["start_ts"] for ph in self.pred_history if ph["actual_75"] is not None]
-
-        # print(f"Plotting residuals. Actual max: {actual_interval_max}, Pred max: {pred_interval_max}, Times: {times}")
-        plt.figure(figsize=(10,5))
-        plt.plot(times, actual_interval_max, '-o', label='Actual Max', color='black')
-        plt.plot(times, pred_interval_max, '-s', label='Predicted Max', color='orange')
-        plt.fill_between(times, actual_interval_max, pred_interval_max, color='orange', alpha=0.2, label='Error Gap')
-
-        plt.xlabel("Prediction Time Step (t)")
-        plt.ylabel("CPU Usage (%)")
-        plt.title("Predicted vs Actual 75th CPU in x-min Horizon")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        # x 軸時間格式
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=10))
-        plt.gcf().autofmt_xdate(rotation=45)
-
-        plt.tight_layout()
-        plt.savefig(f"{self.log_folder}/residuals.png")
         plt.close()

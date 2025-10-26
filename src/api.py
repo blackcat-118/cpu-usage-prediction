@@ -23,7 +23,7 @@ predictor_heartbeat = {}
 # Prometheus metrics
 predicted_cpu = Gauge("upf_predicted_cpu_utilization", "Predicted CPU usage", ["namespace", "pod"])
 
-BROKER_IP = "broker.emqx.io"  # Replace with your broker IP
+BROKER_IP = "140.113.208.76"  # Replace with your broker IP
 MQTT_TOPIC = "upf/metrics"
 time_interval = 10 # seconds
 previous_metrics = defaultdict()
@@ -79,6 +79,13 @@ def start_mqtt_subscriber():
     thread = threading.Thread(target=client.loop_forever, daemon=True)
     thread.start()
 
+def release_resources():
+    for pod in predictors:
+        pod.terminate()
+        del pod
+
+    time.sleep(10)   # wait for threads to release resources
+
 def background_finetune(interval: int = 60):
     def loop():
         while True:
@@ -97,14 +104,10 @@ def startup_event():
     start_mqtt_subscriber()
     # background_finetune(interval=300)  # every 10 minutes
 
-# @app.post("/finetune")
-# def finetune():
-#     try:
-#         for pod, predictor in predictors.items():
-#             predictor.finetune()
-#         return {"status": "finetuned"}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+@app.on_event("shutdown")
+def shutdown_event():
+    print("Shutting down, releasing resources...")
+    release_resources()
 
 @app.get("/metrics")
 def predict():
@@ -114,6 +117,7 @@ def predict():
             if predictor_heartbeat.get(pod, 0) == 0:
                 # skip dead predictors
                 p = predictors.pop(pod)
+                p.terminate()
                 del p
                 predictor_heartbeat.pop(pod)
                 print(f"Removed inactive predictor for pod {pod}")
@@ -139,14 +143,3 @@ def predict():
 @app.get("/buffer")
 def get_metrics():
     return Response(content=metrics_buffer)
-
-# @app.post("/evaluate")
-# def evaluate(payload: dict):
-#     # payload: {"pod": "upf-1", "ground_truth": [...]}
-#     pod = payload.get("pod")
-#     ground_truth = payload.get("ground_truth")
-#     if pod not in predictors:
-#         raise HTTPException(status_code=404, detail="Pod not found")
-#     preds = predictors[pod].predict()
-#     score = predictors[pod].evaluate(ground_truth, preds)
-#     return {"mae": score}
