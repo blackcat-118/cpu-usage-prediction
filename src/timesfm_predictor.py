@@ -34,7 +34,8 @@ os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 os.environ['JAX_PMAP_USE_TENSORSTORE'] = 'false'
 wandb_project = "timesfm-cpu-prediction"
 use_pod_num=True
-LOG_FILELIST = ["./api.py", "./timesfm_predictor.py"]
+RESULT_FILELIST = ["cpu_usage.png", "evaluation.png", "metrics.csv"]
+METRICS_SCRAPE_INTERVAL = 20  # seconds
 
 def compute_trend(cpu_values):
     x = np.arange(len(cpu_values)).reshape(-1, 1)
@@ -49,6 +50,7 @@ class TimesfmPredictor:
         self.pred_len = pred_len
         self.tfm = self._load_pretrained_model(context_len=context_len, horizon_len=pred_len)
         self.wb_runner = None
+        self.log_list = ["src/api.py", "src/timesfm_predictor.py"]
         self.log_folder = f"../results/{self.pod_name}/"
         # collected metrics buffer
         self.cpu_buffer = []   # [(timestamp, value)]
@@ -63,18 +65,23 @@ class TimesfmPredictor:
     def terminate(self):
         print(f"Releasing resources for pod {self.pod_name}")
         if self.wb_runner is not None:
-            self.wb_runner.log_code(root=self.log_folder, include_fn=lambda path: True)
+            for filename in RESULT_FILELIST:
+                self.log_list.append(f"results/{self.pod_name}/{filename}")
+            self.wb_runner.log_code(root="../", include_fn=lambda path: os.path.relpath(path, start="/home/blackcat/cpu-usage-prediction/") in self.log_list)
             self.wb_runner.finish()
 
     def _wandb_init(self):
         self.wb_runner = wandb.init(project=wandb_project, name=self.pod_name, reinit="create_new")
-        self.wb_runner.define_metric("cpu_usage", step_metric="timestamp")
-        self.wb_runner.define_metric("predicted_cpu_usage", step_metric="timestamp")
-        self.wb_runner.define_metric("n3", step_metric="timestamp")
-        self.wb_runner.define_metric("n4", step_metric="timestamp")
-        self.wb_runner.define_metric("n6", step_metric="timestamp")
+        self.wb_runner.define_metric("mae", summary="mean")
+        self.wb_runner.define_metric("mse", summary="mean")
+        self.wb_runner.define_metric("rmse", summary="mean")
+        self.wb_runner.define_metric("cpu_usage", step_metric="timestamp", summary="mean")
+        self.wb_runner.define_metric("predicted_cpu_usage", step_metric="timestamp", summary="max")
+        self.wb_runner.define_metric("n3", step_metric="timestamp", summary="mean")
+        self.wb_runner.define_metric("n4", step_metric="timestamp", summary="mean")
+        self.wb_runner.define_metric("n6", step_metric="timestamp", summary="mean")
         self.wb_runner.define_metric("pod_num", step_metric="timestamp")
-        self.wb_runner.define_metric("session_count", step_metric="timestamp")
+        self.wb_runner.define_metric("session_count", step_metric="timestamp", summary="mean")
 
     def _set_covariates(self):
         padding = list(np.zeros(shape=(self.pred_len,), dtype=float))
@@ -86,14 +93,14 @@ class TimesfmPredictor:
             hparams=timesfm.TimesFmHparams(
                 backend="gpu",
                 per_core_batch_size=1,
-                horizon_len=8,
-                num_layers=10,
+                horizon_len=16,
+                num_layers=5,
                 use_positional_embedding=False,
                 context_len=64,
             ),
             checkpoint=timesfm.TimesFmCheckpoint(
                 huggingface_repo_id="google/timesfm-2.0-500m-jax",
-                local_dir="./checkpoints/pretrained_checkpoint/checkpoint_1301"
+                # local_dir="./checkpoints/pretrained_checkpoint/checkpoint_1301"
             ),
         )
         return tfm
@@ -161,8 +168,8 @@ class TimesfmPredictor:
         best_eval_loss = 1e7
         step_count = 0
         patience = 0
-        NUM_EPOCHS = 5
-        PATIENCE = 5
+        NUM_EPOCHS = 10
+        PATIENCE = 10
         TRAIN_STEPS_PER_EVAL = 100
         CHECKPOINT_DIR=f"{self.log_folder}/checkpoints/"
 
@@ -235,7 +242,7 @@ class TimesfmPredictor:
                         schedules.Cosine,
                         initial_value=1e-3,
                         final_value=1e-4,
-                        total_steps=40000,
+                        total_steps=4000,
                     ),
                     ema_decay=0.9999,
                 ),
@@ -434,12 +441,15 @@ class TimesfmPredictor:
             if last_pred["start_ts"] != gt_ts[0]:
                 print("Warning: Ground truth timestamps do not align with last prediction start time.")
                 print(f"Last prediction start_ts: {last_pred['start_ts']}, GT timestamps: {gt_ts}")
-            eval_score = self.evaluate(gt_values, last_pred["preds"])
+            mae_score = self.evaluate(gt_values, last_pred["preds"], method="mae")
+            mse_score = self.evaluate(gt_values, last_pred["preds"], method="mse")
+            rmse_score = self.evaluate(gt_values, last_pred["preds"], method="rmse")
             self.pred_history[-1]["gt"] = gt_values
-            self.pred_history[-1]["actual_75"] = np.percentile(gt_values, 75) if gt_values else None
-            self.pred_history[-1]["mae"] = eval_score
-            self.wb_runner.log({"mae": eval_score})
-            print(f"Evaluation (MAE): {eval_score}")
+            self.pred_history[-1]["mae"] = mae_score
+            self.wb_runner.log({"mae": mae_score})
+            self.wb_runner.log({"mse": mse_score})
+            self.wb_runner.log({"rmse": rmse_score})
+            print(f"Evaluation (MAE): {mae_score}")
         else:
             gt_values = []
             eval_score = None
@@ -450,7 +460,7 @@ class TimesfmPredictor:
         # 存預測，帶上 timestamp 範圍
         start_ts = self.cpu_buffer[-1][0]  # 最後一個已知點的時間
         self.pred_history.append({
-            "start_ts": start_ts + timedelta(seconds=10),
+            "start_ts": start_ts + timedelta(seconds=METRICS_SCRAPE_INTERVAL),
             "preds": preds,
             "gt": [],
             "mae": None,
@@ -462,15 +472,21 @@ class TimesfmPredictor:
         
         return prediction
 
-    def evaluate(self, ground_truth: list, predictions: list, plot: bool = True):
+    def evaluate(self, ground_truth: list, predictions: list, method="mae"):
         """Evaluate predictions (e.g., MAE)."""
         n = min(len(ground_truth), len(predictions))
         if n == 0:
             return None
-        # RMSE
-        # rmse = np.sqrt(np.mean((np.array(ground_truth[:n]) - np.array(predictions[:n]))**2))
-        return float(np.mean(np.abs(np.array(ground_truth[:n]) - np.array(predictions[:n]))))
-    
+        if method == "mae":
+            return float(np.mean(np.abs(np.array(ground_truth[:n]) - np.array(predictions[:n]))))
+        elif method == "rmse":
+            return np.sqrt(np.mean((np.array(ground_truth[:n]) - np.array(predictions[:n]))**2))
+        elif method == "mse":
+            return np.mean((np.array(ground_truth[:n]) - np.array(predictions[:n]))**2)
+        else:
+            raise ValueError(f"Unknown evaluation method: {method}")
+        return None
+
     def plot(self):
         """Plot ground truth and predictions with timestamp x-axis."""
         plt.figure(figsize=(12, 6))
@@ -484,7 +500,7 @@ class TimesfmPredictor:
         for ph in self.pred_history:
             if "start_ts" in ph and len(ph["preds"]) > 0:
                 for i, p in enumerate(ph["preds"]):
-                    preds[ph["start_ts"] + timedelta(seconds=10 * i)] = p
+                    preds[ph["start_ts"] + timedelta(seconds=METRICS_SCRAPE_INTERVAL * i)] = p
                     
         sorted_preds = dict(sorted(preds.items()))
         # print(f"All predictions for plotting: {sorted_preds.keys()}, {sorted_preds.values()}")

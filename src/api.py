@@ -25,7 +25,7 @@ predicted_cpu = Gauge("upf_predicted_cpu_utilization", "Predicted CPU usage", ["
 
 BROKER_IP = "140.113.208.76"  # Replace with your broker IP
 MQTT_TOPIC = "upf/metrics"
-time_interval = 10 # seconds
+time_interval = 20 # seconds
 previous_metrics = defaultdict()
 
 def on_message(client, userdata, msg):
@@ -80,7 +80,7 @@ def start_mqtt_subscriber():
     thread.start()
 
 def release_resources():
-    for pod in predictors:
+    for pod in predictors.values():
         pod.terminate()
         del pod
 
